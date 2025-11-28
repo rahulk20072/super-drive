@@ -3,7 +3,7 @@ import {
   Search, Plus, Upload, Filter, Grid, List as ListIcon, 
   Settings, LogOut, Loader2, Sparkles, File as FileIcon,
   Video, Music, Lock, Mail, ArrowRight, User as UserIcon,
-  CheckCircle, RefreshCw, KeyRound
+  CheckCircle, RefreshCw, KeyRound, AlertTriangle
 } from 'lucide-react';
 import { 
   onAuthStateChanged, 
@@ -14,10 +14,12 @@ import {
   sendEmailVerification,
   sendPasswordResetEmail,
   GoogleAuthProvider,
-  signInWithPopup
+  signInWithPopup,
+  deleteUser
 } from 'firebase/auth';
-import { auth } from './services/firebase';
-import { DriveFile, FilterState, AIAnalysis, FileType } from './types';
+import { doc, getDoc, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { auth, db } from './services/firebase';
+import { DriveFile, FilterState, AIAnalysis, FileType, UserProfile } from './types';
 import { analyzeFileContent } from './services/gemini';
 import { Modal, Button, Input } from './components/UI';
 import { FileCard, FileViewer } from './components/FileComponents';
@@ -53,6 +55,45 @@ const groupFilesByDate = (files: DriveFile[]) => {
   return groups;
 };
 
+// --- Firestore Service ---
+const syncUserToFirestore = async (user: User) => {
+  try {
+    const userDocRef = doc(db, "users", user.uid);
+    const userSnapshot = await getDoc(userDocRef);
+
+    if (!userSnapshot.exists()) {
+      await setDoc(userDocRef, {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName || user.email?.split('@')[0],
+        photoURL: user.photoURL,
+        createdAt: Date.now(),
+        lastLogin: Date.now()
+      });
+    } else {
+      await updateDoc(userDocRef, {
+        lastLogin: Date.now()
+      });
+    }
+  } catch (error) {
+    console.error("Error syncing user to Firestore:", error);
+  }
+};
+
+const getUserProfile = async (uid: string): Promise<UserProfile | null> => {
+  try {
+    const docRef = doc(db, "users", uid);
+    const docSnap = await getDoc(docRef);
+    if (docSnap.exists()) {
+      return docSnap.data() as UserProfile;
+    }
+    return null;
+  } catch (error) {
+    console.error("Error fetching profile:", error);
+    return null;
+  }
+};
+
 // --- Auth Component ---
 
 const AuthScreen = () => {
@@ -78,9 +119,10 @@ const AuthScreen = () => {
           setVerificationEmail(userCredential.user.email);
           return;
         }
-        // If verified, the onAuthStateChanged in App will handle the redirect
+        // Sync handled in App component
       } else {
         const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        // We sync basic info now, but strictly speaking verified status is simpler to check on login
         await sendEmailVerification(userCredential.user);
         await signOut(auth);
         setVerificationEmail(userCredential.user.email);
@@ -111,7 +153,7 @@ const AuthScreen = () => {
       }
       // Fallback
       else {
-        setError('An error occurred. Please try again.');
+        setError(err.message || 'An error occurred. Please try again.');
       }
     } finally {
       setIsLoading(false);
@@ -152,8 +194,12 @@ const AuthScreen = () => {
       console.error("Google Auth Error:", err);
       if (err.code === 'auth/popup-closed-by-user') {
         setError('Sign in cancelled');
+      } else if (err.code === 'auth/unauthorized-domain') {
+        setError('Domain not authorized in Firebase Console.');
+      } else if (err.code === 'auth/cancelled-popup-request') {
+        setError('Popup closed or blocked.');
       } else {
-        setError('Failed to sign in with Google');
+        setError('Failed to sign in with Google. ' + (err.message || ''));
       }
       setIsLoading(false);
     }
@@ -299,8 +345,8 @@ const AuthScreen = () => {
 
           <form onSubmit={handleSubmit} className="space-y-4">
             {error && (
-              <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100 flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />
+              <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100 flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 mt-0.5 flex-shrink-0" />
                 <span className="flex-1">
                   {error === 'User already exists. Sign in?' ? (
                     <>
@@ -420,7 +466,95 @@ const AuthScreen = () => {
   );
 };
 
-// --- Drive Dashboard Component (Original App Logic) ---
+// --- Profile Modal ---
+interface ProfileModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  userProfile: UserProfile | null;
+  onUpdate: (name: string, photoName: string) => Promise<void>;
+  onDelete: () => Promise<void>;
+}
+
+const ProfileModal: React.FC<ProfileModalProps> = ({ isOpen, onClose, userProfile, onUpdate, onDelete }) => {
+  const [displayName, setDisplayName] = useState(userProfile?.displayName || '');
+  const [photoName, setPhotoName] = useState(userProfile?.photoName || '');
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    if (userProfile) {
+      setDisplayName(userProfile.displayName || '');
+      setPhotoName(userProfile.photoName || '');
+    }
+  }, [userProfile]);
+
+  const handleSubmit = async () => {
+    setIsSaving(true);
+    await onUpdate(displayName, photoName);
+    setIsSaving(false);
+    onClose();
+  };
+
+  const handleDelete = async () => {
+    if (confirm("Are you sure you want to delete your account? This action cannot be undone.")) {
+      await onDelete();
+    }
+  };
+
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} title="User Profile">
+      <div className="p-6 space-y-6">
+        <div className="flex items-center gap-4">
+          <div className="w-20 h-20 bg-gemini-100 rounded-full flex items-center justify-center text-gemini-600 text-2xl font-bold">
+            {userProfile?.photoURL ? (
+               <img src={userProfile.photoURL} className="w-full h-full rounded-full object-cover" alt="Profile" />
+            ) : (
+               userProfile?.displayName?.charAt(0).toUpperCase() || userProfile?.email?.charAt(0).toUpperCase()
+            )}
+          </div>
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">{userProfile?.displayName || 'User'}</h3>
+            <p className="text-sm text-gray-500">{userProfile?.email}</p>
+            <p className="text-xs text-gray-400 mt-1">Member since {new Date(userProfile?.createdAt || 0).toLocaleDateString()}</p>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Display Name</label>
+            <Input 
+              value={displayName} 
+              onChange={(e) => setDisplayName(e.target.value)} 
+              placeholder="Enter your name"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Photo Name / URL</label>
+             <Input 
+              value={photoName} 
+              onChange={(e) => setPhotoName(e.target.value)} 
+              placeholder="Profile photo identifier"
+            />
+          </div>
+        </div>
+
+        <div className="pt-4 flex items-center justify-between border-t border-gray-100">
+           <Button variant="danger" onClick={handleDelete} className="text-sm px-3">
+             Delete Account
+           </Button>
+           <div className="flex gap-2">
+             <Button variant="ghost" onClick={onClose}>Cancel</Button>
+             <Button onClick={handleSubmit} disabled={isSaving}>
+               {isSaving ? <Loader2 className="animate-spin" size={18} /> : 'Save Changes'}
+             </Button>
+           </div>
+        </div>
+      </div>
+    </Modal>
+  );
+};
+
+
+// --- Drive Dashboard Component ---
 
 interface DriveDashboardProps {
   user: User;
@@ -440,6 +574,10 @@ const DriveDashboard: React.FC<DriveDashboardProps> = ({ user }) => {
   const [filter, setFilter] = useState<FilterState>({ search: '', type: 'all', dateRange: 'all' });
   const [isDragging, setIsDragging] = useState(false);
 
+  // Profile State
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
+
   // Upload State
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadPreview, setUploadPreview] = useState<string | null>(null);
@@ -455,6 +593,15 @@ const DriveDashboard: React.FC<DriveDashboardProps> = ({ user }) => {
   useEffect(() => {
     localStorage.setItem(`gemini-drive-files-${user.uid}`, JSON.stringify(files));
   }, [files, user.uid]);
+
+  // Fetch Profile
+  useEffect(() => {
+    const loadProfile = async () => {
+      const profile = await getUserProfile(user.uid);
+      if (profile) setUserProfile(profile);
+    };
+    loadProfile();
+  }, [user.uid]);
 
   // Derived State
   const filteredFiles = useMemo(() => {
@@ -592,6 +739,32 @@ const DriveDashboard: React.FC<DriveDashboardProps> = ({ user }) => {
     signOut(auth);
   };
 
+  // Profile Handlers
+  const handleUpdateProfile = async (name: string, photoName: string) => {
+    try {
+      const userRef = doc(db, 'users', user.uid);
+      await updateDoc(userRef, {
+        displayName: name,
+        photoName: photoName
+      });
+      // Optimistic update
+      setUserProfile(prev => prev ? { ...prev, displayName: name, photoName } : null);
+    } catch (e) {
+      console.error("Failed to update profile", e);
+      alert("Failed to update profile");
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    try {
+      await deleteDoc(doc(db, 'users', user.uid));
+      await deleteUser(user);
+    } catch (e) {
+      console.error("Failed to delete account", e);
+      alert("Failed to delete account. You may need to re-login to perform this action.");
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col font-sans text-gray-900">
       {/* Header */}
@@ -618,10 +791,15 @@ const DriveDashboard: React.FC<DriveDashboardProps> = ({ user }) => {
           </div>
 
           <div className="flex items-center gap-3">
-             <div className="flex items-center gap-2 text-sm text-gray-600 mr-2 bg-gray-50 px-3 py-1.5 rounded-full border border-gray-100">
-                <UserIcon size={14} />
-                <span className="hidden sm:inline">{user.email}</span>
-             </div>
+             <button 
+                onClick={() => setIsProfileModalOpen(true)}
+                className="flex items-center gap-2 text-sm text-gray-700 mr-2 bg-gray-50 hover:bg-gray-100 px-3 py-1.5 rounded-full border border-gray-200 transition-colors"
+             >
+                <div className="w-5 h-5 bg-gemini-200 rounded-full flex items-center justify-center text-xs font-bold text-gemini-700">
+                  {userProfile?.displayName?.charAt(0) || user.email?.charAt(0)}
+                </div>
+                <span className="hidden sm:inline font-medium">{userProfile?.displayName || user.email?.split('@')[0]}</span>
+             </button>
              <button onClick={handleSignOut} className="p-2 hover:bg-red-50 hover:text-red-600 rounded-full text-gray-500 transition-colors" title="Sign Out">
                <LogOut size={20} />
              </button>
@@ -815,6 +993,15 @@ const DriveDashboard: React.FC<DriveDashboardProps> = ({ user }) => {
         </div>
       </Modal>
 
+      {/* Profile Modal */}
+      <ProfileModal 
+        isOpen={isProfileModalOpen}
+        onClose={() => setIsProfileModalOpen(false)}
+        userProfile={userProfile}
+        onUpdate={handleUpdateProfile}
+        onDelete={handleDeleteAccount}
+      />
+
       {/* Full Screen Viewer */}
       {viewFile && (
         <FileViewer file={viewFile} onClose={() => setViewFile(null)} />
@@ -843,7 +1030,13 @@ const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      if (currentUser) {
+        if (currentUser.emailVerified) {
+          // Sync user to firestore whenever auth state confirms a verified user
+          await syncUserToFirestore(currentUser);
+        }
+      }
       setUser(currentUser);
       setIsLoading(false);
     });

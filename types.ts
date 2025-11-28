@@ -25,3 +25,13 @@ export interface FilterState {
   type: FileType | 'all';
   dateRange: 'all' | 'today' | 'week' | 'month';
 }
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL?: string;
+  photoName?: string;
+  createdAt: number;
+  lastLogin: number;
+}
