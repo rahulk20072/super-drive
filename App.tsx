@@ -1,0 +1,822 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import { 
+  Search, Plus, Upload, Filter, Grid, List as ListIcon, 
+  Settings, LogOut, Loader2, Sparkles, File as FileIcon,
+  Video, Music, Lock, Mail, ArrowRight, User as UserIcon,
+  CheckCircle, RefreshCw, KeyRound
+} from 'lucide-react';
+import { 
+  onAuthStateChanged, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut, 
+  User,
+  sendEmailVerification,
+  sendPasswordResetEmail
+} from 'firebase/auth';
+import { auth } from './services/firebase';
+import { DriveFile, FilterState, AIAnalysis, FileType } from './types';
+import { analyzeFileContent } from './services/gemini';
+import { Modal, Button, Input } from './components/UI';
+import { FileCard, FileViewer } from './components/FileComponents';
+
+// --- Utility Functions for App ---
+const getFileType = (mime: string, name: string): FileType => {
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('text/') || name.endsWith('.txt') || name.endsWith('.md')) return 'text';
+  return 'other';
+};
+
+const groupFilesByDate = (files: DriveFile[]) => {
+  const groups: { [key: string]: DriveFile[] } = {};
+  
+  files.forEach(file => {
+    const date = new Date(file.uploadDate);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    let key = new Intl.DateTimeFormat('en-US', { month: 'long', day: 'numeric', year: 'numeric' }).format(date);
+    
+    if (date.toDateString() === today.toDateString()) key = 'Today';
+    else if (date.toDateString() === yesterday.toDateString()) key = 'Yesterday';
+    
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(file);
+  });
+
+  return groups;
+};
+
+// --- Auth Component ---
+
+const AuthScreen = () => {
+  const [isLogin, setIsLogin] = useState(true);
+  const [isResetMode, setIsResetMode] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [verificationEmail, setVerificationEmail] = useState<string | null>(null);
+  const [resetEmailSent, setResetEmailSent] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setIsLoading(true);
+
+    try {
+      if (isLogin) {
+        const userCredential = await signInWithEmailAndPassword(auth, email, password);
+        if (!userCredential.user.emailVerified) {
+          await signOut(auth);
+          setVerificationEmail(userCredential.user.email);
+          return;
+        }
+        // If verified, the onAuthStateChanged in App will handle the redirect
+      } else {
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        await sendEmailVerification(userCredential.user);
+        await signOut(auth);
+        setVerificationEmail(userCredential.user.email);
+      }
+    } catch (err: any) {
+      console.error("Auth Error:", err.code, err.message);
+      const errorCode = err.code;
+      
+      // Handle "Account already exists"
+      if (errorCode === 'auth/email-already-in-use') {
+        setError('User already exists. Sign in?');
+      } 
+      // Handle "Incorrect Credentials" (Login)
+      else if (
+        errorCode === 'auth/invalid-credential' || 
+        errorCode === 'auth/user-not-found' || 
+        errorCode === 'auth/wrong-password'
+      ) {
+        setError('Password or Email Incorrect');
+      }
+      // Handle Invalid Email
+      else if (errorCode === 'auth/invalid-email') {
+        setError('Please enter a valid email address.');
+      }
+      // Handle Weak Password (Registration)
+      else if (errorCode === 'auth/weak-password') {
+        setError('Password must be at least 6 characters.');
+      }
+      // Fallback
+      else {
+        setError('An error occurred. Please try again.');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handlePasswordReset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setIsLoading(true);
+
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setResetEmailSent(true);
+    } catch (err: any) {
+      console.error(err);
+      const errorCode = err.code;
+      if (errorCode === 'auth/user-not-found') {
+        setError('No user found with this email.');
+      } else if (errorCode === 'auth/invalid-email') {
+        setError('Please enter a valid email address.');
+      } else {
+        setError('Failed to send reset email. Try again.');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleBackToLogin = () => {
+    setVerificationEmail(null);
+    setResetEmailSent(false);
+    setIsResetMode(false);
+    setIsLogin(true);
+    setError('');
+    setPassword('');
+  };
+
+  if (verificationEmail) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden p-8 text-center animate-in fade-in zoom-in duration-300">
+          <div className="w-16 h-16 bg-green-100 text-green-600 rounded-full mx-auto flex items-center justify-center mb-6">
+            <Mail size={32} />
+          </div>
+          <h2 className="text-2xl font-bold text-gray-800 mb-2">Verify your email</h2>
+          <p className="text-gray-600 mb-8">
+            We have sent you a verification email to <br />
+            <span className="font-semibold text-gray-900">{verificationEmail}</span>.
+            <br />
+            Verify it and log in.
+          </p>
+          
+          <button
+            onClick={handleBackToLogin}
+            className="w-full bg-gemini-600 hover:bg-gemini-700 text-white font-medium py-2.5 rounded-xl shadow-lg shadow-gemini-200 transition-all"
+          >
+            Log In
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (resetEmailSent) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden p-8 text-center animate-in fade-in zoom-in duration-300">
+          <div className="w-16 h-16 bg-blue-100 text-blue-600 rounded-full mx-auto flex items-center justify-center mb-6">
+            <CheckCircle size={32} />
+          </div>
+          <h2 className="text-2xl font-bold text-gray-800 mb-2">Check your email</h2>
+          <p className="text-gray-600 mb-8">
+            We sent you a password change link to <br />
+            <span className="font-semibold text-gray-900">{email}</span>.
+          </p>
+          
+          <button
+            onClick={handleBackToLogin}
+            className="w-full bg-gemini-600 hover:bg-gemini-700 text-white font-medium py-2.5 rounded-xl shadow-lg shadow-gemini-200 transition-all"
+          >
+            Sign In
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (isResetMode) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
+        <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden animate-in fade-in zoom-in duration-300">
+          <div className="p-8">
+            <div className="text-center mb-6">
+              <div className="w-14 h-14 bg-gemini-50 text-gemini-600 rounded-2xl mx-auto flex items-center justify-center mb-4">
+                <KeyRound size={28} />
+              </div>
+              <h2 className="text-xl font-bold text-gray-800">Reset Password</h2>
+              <p className="text-gray-500 text-sm mt-1">Enter your email to receive a reset link</p>
+            </div>
+
+            <form onSubmit={handlePasswordReset} className="space-y-4">
+              {error && (
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100 flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />
+                  {error}
+                </div>
+              )}
+              
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-500 uppercase tracking-wider ml-1">Email</label>
+                <div className="relative">
+                  <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                  <input
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-gemini-500/20 focus:border-gemini-500 outline-none transition-all"
+                    placeholder="name@example.com"
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isLoading}
+                className="w-full bg-gemini-600 hover:bg-gemini-700 text-white font-medium py-2.5 rounded-xl shadow-lg shadow-gemini-200 transition-all flex items-center justify-center gap-2 mt-4 disabled:opacity-70 disabled:cursor-not-allowed"
+              >
+                {isLoading ? (
+                  <Loader2 size={20} className="animate-spin" />
+                ) : (
+                  'Get Reset Link'
+                )}
+              </button>
+            </form>
+
+            <div className="mt-6 pt-6 border-t border-gray-100 text-center">
+              <button
+                onClick={handleBackToLogin}
+                className="text-gray-500 font-medium hover:text-gray-700 text-sm"
+              >
+                Back to Sign In
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-4">
+      <div className="w-full max-w-md bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden animate-in fade-in zoom-in duration-300">
+        <div className="bg-gradient-to-r from-gemini-600 to-purple-600 p-8 text-center">
+          <div className="w-16 h-16 bg-white/20 rounded-2xl mx-auto flex items-center justify-center backdrop-blur-sm mb-4">
+             <Sparkles size={32} className="text-white" />
+          </div>
+          <h1 className="text-2xl font-bold text-white mb-1">Super Drive</h1>
+          <p className="text-blue-100 text-sm">AI-Powered Intelligent Storage</p>
+        </div>
+
+        <div className="p-8">
+          <h2 className="text-xl font-semibold text-gray-800 mb-6 text-center">
+            {isLogin ? 'Welcome Back' : 'Create Account'}
+          </h2>
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {error && (
+              <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100 flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-red-500 flex-shrink-0" />
+                <span className="flex-1">
+                  {error === 'User already exists. Sign in?' ? (
+                    <>
+                      User already exists. <button type="button" onClick={() => { setIsLogin(true); setError(''); }} className="font-semibold underline hover:text-red-800">Sign in?</button>
+                    </>
+                  ) : error}
+                </span>
+              </div>
+            )}
+            
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-gray-500 uppercase tracking-wider ml-1">Email</label>
+              <div className="relative">
+                <Mail className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                <input
+                  type="email"
+                  required
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full pl-10 pr-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-gemini-500/20 focus:border-gemini-500 outline-none transition-all"
+                  placeholder="name@example.com"
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-gray-500 uppercase tracking-wider ml-1">Password</label>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full pl-10 pr-4 py-2.5 border border-gray-200 rounded-xl focus:ring-2 focus:ring-gemini-500/20 focus:border-gemini-500 outline-none transition-all"
+                  placeholder="••••••••"
+                />
+              </div>
+              {isLogin && (
+                <div className="flex justify-end pt-1">
+                  <button 
+                    type="button"
+                    onClick={() => { setIsResetMode(true); setError(''); }}
+                    className="text-xs font-medium text-gemini-600 hover:text-gemini-700 hover:underline"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoading}
+              className="w-full bg-gemini-600 hover:bg-gemini-700 text-white font-medium py-2.5 rounded-xl shadow-lg shadow-gemini-200 transition-all flex items-center justify-center gap-2 mt-4 disabled:opacity-70 disabled:cursor-not-allowed"
+            >
+              {isLoading ? (
+                <Loader2 size={20} className="animate-spin" />
+              ) : (
+                <>
+                  {isLogin ? 'Sign In' : 'Create Account'} <ArrowRight size={18} />
+                </>
+              )}
+            </button>
+          </form>
+
+          <div className="mt-6 pt-6 border-t border-gray-100 text-center">
+            <p className="text-gray-500 text-sm">
+              {isLogin ? "Don't have an account?" : "Already have an account?"}
+              <button
+                onClick={() => { setIsLogin(!isLogin); setError(''); }}
+                className="ml-2 text-gemini-600 font-semibold hover:underline focus:outline-none"
+              >
+                {isLogin ? 'Sign Up' : 'Log In'}
+              </button>
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- Drive Dashboard Component (Original App Logic) ---
+
+interface DriveDashboardProps {
+  user: User;
+}
+
+const DriveDashboard: React.FC<DriveDashboardProps> = ({ user }) => {
+  // State
+  const [files, setFiles] = useState<DriveFile[]>(() => {
+    // User-specific storage key
+    const saved = localStorage.getItem(`gemini-drive-files-${user.uid}`);
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [viewFile, setViewFile] = useState<DriveFile | null>(null);
+  const [isUploadModalOpen, setIsUploadModalOpen] = useState(false);
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [editingFileId, setEditingFileId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<FilterState>({ search: '', type: 'all', dateRange: 'all' });
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Upload State
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadPreview, setUploadPreview] = useState<string | null>(null);
+  const [uploadName, setUploadName] = useState('');
+  const [uploadNotes, setUploadNotes] = useState('');
+  const [isUploading, setIsUploading] = useState(false);
+  
+  // Edit State
+  const [editName, setEditName] = useState('');
+  const [editNotes, setEditNotes] = useState('');
+
+  // Persist files
+  useEffect(() => {
+    localStorage.setItem(`gemini-drive-files-${user.uid}`, JSON.stringify(files));
+  }, [files, user.uid]);
+
+  // Derived State
+  const filteredFiles = useMemo(() => {
+    let result = files;
+
+    // Search
+    if (filter.search) {
+      const q = filter.search.toLowerCase();
+      result = result.filter(f => 
+        f.name.toLowerCase().includes(q) || 
+        f.notes.toLowerCase().includes(q) ||
+        f.aiData?.summary.toLowerCase().includes(q) ||
+        f.aiData?.tags.some(t => t.toLowerCase().includes(q))
+      );
+    }
+
+    // Type Filter
+    if (filter.type !== 'all') {
+      result = result.filter(f => f.type === filter.type);
+    }
+
+    // Date Sort (Implicitly Descending)
+    return result.sort((a, b) => b.uploadDate - a.uploadDate);
+  }, [files, filter]);
+
+  const groupedFiles = groupFilesByDate(filteredFiles);
+
+  // Handlers
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      prepareUpload(e.dataTransfer.files[0]);
+    }
+  };
+
+  const prepareUpload = (file: File) => {
+    setUploadFile(file);
+    setUploadName(file.name);
+    setUploadNotes('');
+    
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setUploadPreview(e.target?.result as string);
+    };
+    reader.readAsDataURL(file);
+    
+    setIsUploadModalOpen(true);
+  };
+
+  const handleConfirmUpload = async () => {
+    if (!uploadFile || !uploadPreview) return;
+    
+    setIsUploading(true);
+    
+    const newFile: DriveFile = {
+      id: crypto.randomUUID(),
+      name: uploadName,
+      type: getFileType(uploadFile.type, uploadName),
+      mimeType: uploadFile.type,
+      size: uploadFile.size,
+      uploadDate: Date.now(),
+      data: uploadPreview,
+      notes: uploadNotes,
+      aiData: {
+        isAnalyzing: true,
+        summary: '',
+        tags: []
+      }
+    };
+
+    setFiles(prev => [newFile, ...prev]);
+    setIsUploadModalOpen(false);
+    setIsUploading(false);
+
+    // Trigger AI Analysis in background
+    try {
+      const aiResult = await analyzeFileContent(newFile);
+      setFiles(prev => prev.map(f => 
+        f.id === newFile.id 
+          ? { ...f, aiData: { ...aiResult, isAnalyzing: false } } 
+          : f
+      ));
+    } catch (err) {
+      console.error("Analysis failed", err);
+      setFiles(prev => prev.map(f => 
+        f.id === newFile.id 
+          ? { ...f, aiData: { isAnalyzing: false, summary: "Analysis failed", tags: [] } } 
+          : f
+      ));
+    }
+    
+    // Reset upload state
+    setUploadFile(null);
+    setUploadPreview(null);
+  };
+
+  const handleDelete = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    if (confirm('Are you sure you want to delete this file?')) {
+      setFiles(prev => prev.filter(f => f.id !== id));
+    }
+  };
+
+  const openEditModal = (e: React.MouseEvent, file: DriveFile) => {
+    e.stopPropagation();
+    setEditingFileId(file.id);
+    setEditName(file.name);
+    setEditNotes(file.notes);
+    setIsEditModalOpen(true);
+  };
+
+  const handleSaveEdit = () => {
+    if (!editingFileId) return;
+    setFiles(prev => prev.map(f => 
+      f.id === editingFileId 
+        ? { ...f, name: editName, notes: editNotes }
+        : f
+    ));
+    setIsEditModalOpen(false);
+    setEditingFileId(null);
+  };
+
+  const handleSignOut = () => {
+    signOut(auth);
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 flex flex-col font-sans text-gray-900">
+      {/* Header */}
+      <header className="bg-white sticky top-0 z-30 border-b border-gray-200 px-6 py-3 shadow-sm">
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-6">
+          <div className="flex items-center gap-2">
+            <div className="w-10 h-10 bg-gradient-to-br from-gemini-500 to-purple-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-gemini-200">
+               <Sparkles size={20} className="fill-white" />
+            </div>
+            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-gray-800 to-gray-600">
+              Super Drive
+            </h1>
+          </div>
+          
+          <div className="flex-1 max-w-2xl relative group hidden sm:block">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 group-focus-within:text-gemini-500 transition-colors" size={20} />
+            <input 
+              type="text" 
+              placeholder="Search files, contents, or AI tags..." 
+              value={filter.search}
+              onChange={(e) => setFilter(prev => ({ ...prev, search: e.target.value }))}
+              className="w-full pl-10 pr-4 py-2.5 bg-gray-100 border-transparent rounded-xl focus:bg-white focus:ring-2 focus:ring-gemini-100 focus:border-gemini-500 transition-all outline-none"
+            />
+          </div>
+
+          <div className="flex items-center gap-3">
+             <div className="flex items-center gap-2 text-sm text-gray-600 mr-2 bg-gray-50 px-3 py-1.5 rounded-full border border-gray-100">
+                <UserIcon size={14} />
+                <span className="hidden sm:inline">{user.email}</span>
+             </div>
+             <button onClick={handleSignOut} className="p-2 hover:bg-red-50 hover:text-red-600 rounded-full text-gray-500 transition-colors" title="Sign Out">
+               <LogOut size={20} />
+             </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <main className="flex-1 max-w-7xl mx-auto w-full p-6 flex flex-col">
+        
+        {/* Toolbar */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-8">
+          
+          <div className="flex items-center gap-2 overflow-x-auto pb-2 sm:pb-0 w-full sm:w-auto no-scrollbar">
+            <button 
+              onClick={() => setFilter(prev => ({ ...prev, type: 'all' }))}
+              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors whitespace-nowrap ${filter.type === 'all' ? 'bg-gray-900 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+            >
+              All Files
+            </button>
+            <button 
+              onClick={() => setFilter(prev => ({ ...prev, type: 'image' }))}
+              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors whitespace-nowrap flex items-center gap-1.5 ${filter.type === 'image' ? 'bg-gray-900 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+            >
+              Images
+            </button>
+            <button 
+              onClick={() => setFilter(prev => ({ ...prev, type: 'video' }))}
+              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors whitespace-nowrap flex items-center gap-1.5 ${filter.type === 'video' ? 'bg-gray-900 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+            >
+              Video
+            </button>
+            <button 
+              onClick={() => setFilter(prev => ({ ...prev, type: 'audio' }))}
+              className={`px-4 py-2 rounded-full text-sm font-medium transition-colors whitespace-nowrap flex items-center gap-1.5 ${filter.type === 'audio' ? 'bg-gray-900 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+            >
+              Music
+            </button>
+            <button 
+               onClick={() => setFilter(prev => ({ ...prev, type: 'text' }))}
+               className={`px-4 py-2 rounded-full text-sm font-medium transition-colors whitespace-nowrap flex items-center gap-1.5 ${filter.type === 'text' ? 'bg-gray-900 text-white' : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}
+            >
+              Documents
+            </button>
+          </div>
+
+          <Button onClick={() => document.getElementById('file-upload')?.click()}>
+            <Plus size={18} /> New Upload
+          </Button>
+          <input 
+            type="file" 
+            id="file-upload" 
+            className="hidden" 
+            onChange={(e) => e.target.files?.[0] && prepareUpload(e.target.files[0])}
+          />
+        </div>
+
+        {/* Drop Zone / Empty State */}
+        {files.length === 0 && !filter.search ? (
+           <div 
+             className={`flex-1 flex flex-col items-center justify-center border-2 border-dashed rounded-3xl transition-colors ${isDragging ? 'border-gemini-500 bg-gemini-50' : 'border-gray-300 bg-white'}`}
+             onDragOver={handleDragOver}
+             onDragLeave={handleDragLeave}
+             onDrop={handleDrop}
+           >
+             <div className="w-20 h-20 bg-gray-50 rounded-full flex items-center justify-center mb-6">
+                <Upload size={32} className="text-gray-400" />
+             </div>
+             <h3 className="text-xl font-semibold text-gray-800 mb-2">Drop files here to upload</h3>
+             <p className="text-gray-500 max-w-sm text-center mb-8">
+               Support for Images, Video, Audio, PDFs, and Text files. Gemini AI will automatically tag and summarize them.
+             </p>
+             <Button onClick={() => document.getElementById('file-upload')?.click()} variant="secondary">
+               Select Files
+             </Button>
+           </div>
+        ) : (
+          <div className="flex-1 overflow-y-auto pb-20" onDragOver={handleDragOver} onDrop={handleDrop}>
+             {Object.keys(groupedFiles).length === 0 && (
+                <div className="text-center py-20">
+                  <p className="text-gray-500">No files found matching your filters.</p>
+                </div>
+             )}
+             
+             {Object.entries(groupedFiles).map(([dateLabel, groupFiles]) => (
+               <div key={dateLabel} className="mb-8 animate-in slide-in-from-bottom-2 duration-500">
+                 <h2 className="text-sm font-semibold text-gray-500 mb-4 sticky top-0 bg-gray-50 py-2 z-10 flex items-center gap-2">
+                   {dateLabel} <span className="text-xs font-normal bg-gray-200 px-2 py-0.5 rounded-full text-gray-600">{groupFiles.length}</span>
+                 </h2>
+                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                   {groupFiles.map(file => (
+                     <FileCard 
+                       key={file.id} 
+                       file={file} 
+                       onClick={() => setViewFile(file)}
+                       onDelete={(e) => handleDelete(e, file.id)}
+                       onEdit={(e) => openEditModal(e, file)}
+                     />
+                   ))}
+                 </div>
+               </div>
+             ))}
+          </div>
+        )}
+      </main>
+
+      {/* Upload Modal */}
+      <Modal 
+        isOpen={isUploadModalOpen} 
+        onClose={() => !isUploading && setIsUploadModalOpen(false)}
+        title="Upload File"
+      >
+        <div className="p-6 space-y-4">
+          {/* File Preview */}
+          <div className="w-full h-48 bg-gray-100 rounded-xl overflow-hidden flex items-center justify-center relative border border-gray-200">
+             {uploadPreview && uploadFile?.type.startsWith('image/') ? (
+               <img src={uploadPreview} alt="Preview" className="w-full h-full object-contain" />
+             ) : (
+               <FileIcon className="text-gray-400 w-16 h-16" />
+             )}
+             <div className="absolute top-2 right-2 bg-black/60 text-white text-xs px-2 py-1 rounded-md backdrop-blur-sm">
+               {formatBytes(uploadFile?.size || 0)}
+             </div>
+          </div>
+
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">File Name</label>
+              <Input 
+                value={uploadName} 
+                onChange={(e) => setUploadName(e.target.value)} 
+                placeholder="Enter file name"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Notes (Optional)</label>
+              <textarea 
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gemini-500/20 focus:border-gemini-500 min-h-[100px] resize-none"
+                placeholder="Add some details about this file..."
+                value={uploadNotes}
+                onChange={(e) => setUploadNotes(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="pt-2 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-sm text-gemini-600 bg-gemini-50 px-3 py-1.5 rounded-lg border border-gemini-100">
+               <Sparkles size={16} />
+               <span>AI Analysis enabled</span>
+            </div>
+            <div className="flex items-center gap-2">
+               <Button variant="ghost" onClick={() => setIsUploadModalOpen(false)} disabled={isUploading}>Cancel</Button>
+               <Button onClick={handleConfirmUpload} disabled={isUploading}>
+                 {isUploading ? (
+                   <>
+                     <Loader2 size={18} className="animate-spin" /> Uploading...
+                   </>
+                 ) : 'Upload'}
+               </Button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Edit Modal */}
+      <Modal
+        isOpen={isEditModalOpen}
+        onClose={() => setIsEditModalOpen(false)}
+        title="Edit File Details"
+      >
+        <div className="p-6 space-y-4">
+           <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">File Name</label>
+              <Input 
+                value={editName} 
+                onChange={(e) => setEditName(e.target.value)} 
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+              <textarea 
+                className="w-full px-3 py-2 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-gemini-500/20 focus:border-gemini-500 min-h-[100px] resize-none"
+                value={editNotes}
+                onChange={(e) => setEditNotes(e.target.value)}
+              />
+            </div>
+            <div className="flex justify-end pt-2 gap-2">
+              <Button variant="ghost" onClick={() => setIsEditModalOpen(false)}>Cancel</Button>
+              <Button onClick={handleSaveEdit}>Save Changes</Button>
+            </div>
+        </div>
+      </Modal>
+
+      {/* Full Screen Viewer */}
+      {viewFile && (
+        <FileViewer file={viewFile} onClose={() => setViewFile(null)} />
+      )}
+
+      {/* Drag Overlay */}
+      {isDragging && !isUploadModalOpen && (
+        <div 
+          className="fixed inset-0 z-50 bg-gemini-500/90 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200"
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+        >
+           <Upload className="text-white w-20 h-20 mb-4 animate-bounce" />
+           <h2 className="text-3xl font-bold text-white">Drop to Upload</h2>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- Root App ---
+
+const App: React.FC = () => {
+  const [user, setUser] = useState<User | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <Loader2 className="w-10 h-10 text-gemini-600 animate-spin" />
+      </div>
+    );
+  }
+
+  // Ensure user is verified before showing the dashboard
+  if (!user || !user.emailVerified) {
+    return <AuthScreen />;
+  }
+
+  return <DriveDashboard user={user} />;
+};
+
+// Helper for bytes
+const formatBytes = (bytes: number) => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+export default App;
